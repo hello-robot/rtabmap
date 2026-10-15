@@ -4168,6 +4168,12 @@ bool Rtabmap::process(
 		}
 	}
 
+	// Views of nodes merged by Mem/ReduceGraph this update, placed with the optimized poses
+	// (Mem/ReduceGraphGridOwnership).
+	std::set<int> modifiedGridIds;
+	_memory->applyMergedGrids(_optimizedPoses, &modifiedGridIds);
+	statistics_.setModifiedGridIds(modifiedGridIds);
+
 	timeMapOptimization = timer.ticks();
 	ULOGGER_INFO("timeMapOptimization=%fs", timeMapOptimization);
 

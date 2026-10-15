@@ -89,6 +89,10 @@ Memory::Memory(const ParametersMap & parameters) :
 	_localizationDataSaved(Parameters::defaultMemLocalizationDataSaved()),
 	_flannIndexSaved(Parameters::defaultKpFlannIndexSaved()),
 	_reduceGraph(Parameters::defaultMemReduceGraph()),
+	_reduceGraphMergedKept(Parameters::defaultMemReduceGraphMergedKept()),
+	_reduceGraphGridOwnership(Parameters::defaultMemReduceGraphGridOwnership()),
+	_reduceGraphGridRadius(Parameters::defaultMemReduceGraphGridRadius()),
+	_gridRangeMax(Parameters::defaultGridRangeMax()),
 	_maxStMemSize(Parameters::defaultMemSTMSize()),
 	_recentWmRatio(Parameters::defaultMemRecentWmRatio()),
 	_transferSortingByWeightId(Parameters::defaultMemTransferSortingByWeightId()),
@@ -828,6 +832,10 @@ void Memory::parseParameters(const ParametersMap & parameters)
 	Parameters::parse(params, Parameters::kMemLoadVisualLocalFeaturesOnInit(), _loadVisualLocalFeaturesOnInit);
 	Parameters::parse(params, Parameters::kMemSaveDepth16Format(), _saveDepth16Format);
 	Parameters::parse(params, Parameters::kMemReduceGraph(), _reduceGraph);
+	Parameters::parse(params, Parameters::kMemReduceGraphMergedKept(), _reduceGraphMergedKept);
+	Parameters::parse(params, Parameters::kMemReduceGraphGridOwnership(), _reduceGraphGridOwnership);
+	Parameters::parse(params, Parameters::kMemReduceGraphGridRadius(), _reduceGraphGridRadius);
+	Parameters::parse(params, Parameters::kGridRangeMax(), _gridRangeMax);
 	Parameters::parse(params, Parameters::kMemNotLinkedNodesKept(), _notLinkedNodesKeptInDb);
 	Parameters::parse(params, Parameters::kMemIntermediateNodeDataKept(), _saveIntermediateNodeData);
 	Parameters::parse(params, Parameters::kMemImageCompressionFormat(), _rgbCompressionFormat);
@@ -1600,10 +1608,27 @@ void Memory::moveSignatureToWMFromSTM(int id, int * reducedToOut)
 			std::multimap<int, Link> links = s->getLinks();
 			// Setting keepLinkedInDb=true to make sure we save all visual
 			// words that could be referenced in a previously
-			// transferred node in LTM (#979)
-			reducedId = reduceNode(s->id(), 0, /*keepLinkedInDb*/ true);
+			// transferred node in LTM (#979). With every node in WM no word
+			// can be referenced from LTM, so the merged node can be deleted.
+			bool keepLinkedInDb = _reduceGraphMergedKept || !_allNodesInWM;
+			if(!_reduceGraphMergedKept && !_allNodesInWM)
+			{
+				UWARN("%s=false is ignored: not all nodes are in working memory, merged node %d is kept in the database.",
+						Parameters::kMemReduceGraphMergedKept().c_str(), s->id());
+			}
+			// The view of s is lost with it when merged; keep what is confirmed until the
+			// optimized poses are known (applyMergedGrids()).
+			MergedGrid merged;
+			bool hasMergedGrid = _reduceGraphGridOwnership && confirmedGrid(s, merged);
+			// s is deleted by reduceNode() when keepLinkedInDb is false: only use id below.
+			reducedId = reduceNode(s->id(), 0, keepLinkedInDb);
+			s = 0;
 			if(reducedToOut) {
 				*reducedToOut = reducedId;
+			}
+			if(reducedId>0 && hasMergedGrid && reducedId == merged.targetId)
+			{
+				_mergedGrids.push_back(merged);
 			}
 			if(reducedId>0)
 			{
@@ -1611,7 +1636,7 @@ void Memory::moveSignatureToWMFromSTM(int id, int * reducedToOut)
 				{
 					if(iter->second.type() == Link::kNeighbor)
 					{
-						if(_lastGlobalLoopClosureId == s->id())
+						if(_lastGlobalLoopClosureId == id)
 						{
 							_lastGlobalLoopClosureId = iter->first;
 						}
@@ -2198,6 +2223,8 @@ void Memory::clear()
 	}
 	_stMem.clear();
 	_stMemIntermediateNodesCount = 0;
+	// Merged views not applied yet are lost: there are no optimized poses to place them with.
+	_mergedGrids.clear();
 
 	this->cleanUnusedWords();
 
@@ -5161,6 +5188,288 @@ int Memory::cleanupLocalGrids(
 		}
 	}
 	return gridsScansModified;
+}
+
+namespace {
+
+typedef std::pair<int, int> CellKey;
+const unsigned char kSeenFree = 1;
+const unsigned char kSeenObstacle = 2;
+
+CellKey cellKey(const cv::Point3f & pt, float cellSize)
+{
+	return CellKey(int(std::floor(pt.x/cellSize+0.5f)), int(std::floor(pt.y/cellSize+0.5f)));
+}
+
+// Local grid cell i (x y [z ...]) moved by t.
+cv::Point3f cellPoint(const cv::Mat & cells, int i, const Transform & t)
+{
+	const float * ptr = cells.ptr<float>(0, i);
+	return util3d::transformPoint(cv::Point3f(ptr[0], ptr[1], cells.channels()==2?0:ptr[2]), t);
+}
+
+void markCells(const cv::Mat & cells, const Transform & t, float cellSize, unsigned char flag, std::map<CellKey, unsigned char> & seen)
+{
+	for(int i=0; i<cells.cols; ++i)
+	{
+		seen[cellKey(cellPoint(cells, i, t), cellSize)] |= flag;
+	}
+}
+
+void insertKeys(const cv::Mat & cells, const Transform & t, float cellSize, std::set<CellKey> & keys)
+{
+	for(int i=0; i<cells.cols; ++i)
+	{
+		keys.insert(cellKey(cellPoint(cells, i, t), cellSize));
+	}
+}
+
+// Cells another node saw in the same state: free cells seen free (and never as an obstacle) at
+// the same cell, obstacle cells seen as an obstacle at the same or a neighbor cell (grids of
+// different nodes are rotated, so a thin obstacle can fall on the next cell).
+cv::Mat confirmedCells(const cv::Mat & cells, float cellSize, const std::map<CellKey, unsigned char> & seen, bool obstacle)
+{
+	cv::Mat kept(1, cells.cols, cells.type());
+	int oi = 0;
+	for(int i=0; i<cells.cols; ++i)
+	{
+		CellKey key = cellKey(cellPoint(cells, i, Transform::getIdentity()), cellSize);
+		bool confirmed = false;
+		if(obstacle)
+		{
+			for(int dx=-1; dx<=1 && !confirmed; ++dx)
+			{
+				for(int dy=-1; dy<=1 && !confirmed; ++dy)
+				{
+					std::map<CellKey, unsigned char>::const_iterator jter = seen.find(CellKey(key.first+dx, key.second+dy));
+					confirmed = jter!=seen.end() && (jter->second & kSeenObstacle);
+				}
+			}
+		}
+		else
+		{
+			std::map<CellKey, unsigned char>::const_iterator jter = seen.find(key);
+			confirmed = jter!=seen.end() && jter->second == kSeenFree;
+		}
+		if(confirmed)
+		{
+			cells.col(i).copyTo(kept.col(oi++));
+		}
+	}
+	return oi?cv::Mat(kept, cv::Range::all(), cv::Range(0, oi)).clone():cv::Mat();
+}
+
+// Cells of a node at pose t that do not fall on keys; changed is set if any was removed.
+cv::Mat withoutCells(const cv::Mat & cells, const Transform & t, float cellSize, const std::set<CellKey> & keys, bool & changed)
+{
+	if(cells.empty())
+	{
+		return cells;
+	}
+	cv::Mat kept(1, cells.cols, cells.type());
+	int oi = 0;
+	for(int i=0; i<cells.cols; ++i)
+	{
+		if(keys.find(cellKey(cellPoint(cells, i, t), cellSize)) == keys.end())
+		{
+			cells.col(i).copyTo(kept.col(oi++));
+		}
+	}
+	if(oi == cells.cols)
+	{
+		return cells;
+	}
+	changed = true;
+	return oi?cv::Mat(kept, cv::Range::all(), cv::Range(0, oi)).clone():cv::Mat();
+}
+
+// cells followed by added moved by t, in the channel layout of cells (or of added if cells is empty).
+cv::Mat appendedCells(const cv::Mat & cells, const cv::Mat & added, const Transform & t)
+{
+	if(added.empty())
+	{
+		return cells;
+	}
+	cv::Mat moved = cv::Mat::zeros(1, added.cols, cells.empty()?added.type():cells.type());
+	int copied = std::min(added.channels(), moved.channels());
+	for(int i=0; i<added.cols; ++i)
+	{
+		const float * in = added.ptr<float>(0, i);
+		float * out = moved.ptr<float>(0, i);
+		for(int c=0; c<copied; ++c)
+		{
+			out[c] = in[c];
+		}
+		cv::Point3f pt = cellPoint(added, i, t);
+		out[0] = pt.x;
+		out[1] = pt.y;
+		if(moved.channels() > 2)
+		{
+			out[2] = pt.z;
+		}
+	}
+	if(cells.empty())
+	{
+		return moved;
+	}
+	cv::Mat out;
+	cv::hconcat(cells, moved, out);
+	return out;
+}
+
+} // namespace
+
+bool Memory::confirmedGrid(const Signature * s, MergedGrid & merged)
+{
+	// The node s will be merged into: the last reducible link, as in reduceNode().
+	merged.targetId = 0;
+	for(std::multimap<int, Link>::const_iterator iter=s->getLinks().begin(); iter!=s->getLinks().end(); ++iter)
+	{
+		if(canBeReduced(iter->second, 0.0f, 0))
+		{
+			merged.targetId = iter->second.to();
+			merged.newInTarget = iter->second.transform().inverse();
+		}
+	}
+	if(merged.targetId == 0 || s->getPose().isNull())
+	{
+		return false;
+	}
+
+	cv::Mat ground, obstacles, empty;
+	s->sensorData().uncompressDataConst(0, 0, 0, 0, &ground, &obstacles, &empty);
+	merged.cellSize = s->sensorData().gridCellSize();
+	if(merged.cellSize <= 0.0f || (ground.empty() && obstacles.empty() && empty.empty()))
+	{
+		return false;
+	}
+
+	// What the nodes still in STM (all newer than s, same session) saw, in the frame of s.
+	std::map<CellKey, unsigned char> seen;
+	Transform sInv = s->getPose().inverse();
+	for(std::set<int>::const_iterator iter=_stMem.begin(); iter!=_stMem.end(); ++iter)
+	{
+		const Signature * n = this->getSignature(*iter);
+		if(n == 0 || n == s || n->getWeight() < 0 || n->mapId() != s->mapId() ||
+		   n->getPose().isNull() || n->sensorData().gridCellSize() != merged.cellSize)
+		{
+			continue;
+		}
+		cv::Mat nGround, nObstacles, nEmpty;
+		n->sensorData().uncompressDataConst(0, 0, 0, 0, &nGround, &nObstacles, &nEmpty);
+		Transform t = sInv * n->getPose();
+		markCells(nGround, t, merged.cellSize, kSeenFree, seen);
+		markCells(nEmpty, t, merged.cellSize, kSeenFree, seen);
+		markCells(nObstacles, t, merged.cellSize, kSeenObstacle, seen);
+	}
+
+	merged.ground = confirmedCells(ground, merged.cellSize, seen, false);
+	merged.obstacles = confirmedCells(obstacles, merged.cellSize, seen, true);
+	merged.empty = confirmedCells(empty, merged.cellSize, seen, false);
+	UDEBUG("Node %d merged into %d: %d/%d ground, %d/%d obstacle, %d/%d empty cells confirmed",
+			s->id(), merged.targetId,
+			merged.ground.cols, ground.cols, merged.obstacles.cols, obstacles.cols, merged.empty.cols, empty.cols);
+	return !(merged.ground.empty() && merged.obstacles.empty() && merged.empty.empty());
+}
+
+void Memory::setLocalGrid(int id, const cv::Mat & ground, const cv::Mat & obstacles, const cv::Mat & empty,
+		float cellSize, const cv::Point3f & viewPoint)
+{
+	Signature * s = this->_getSignature(id);
+	if(s && (!s->isSaved() || s->sensorData().gridCellSize() != 0.0f))
+	{
+		// setOccupancyGrid() refuses to overwrite a grid: clear it first.
+		s->sensorData().setOccupancyGrid(cv::Mat(), cv::Mat(), cv::Mat(), 0, cv::Point3f());
+		s->sensorData().setOccupancyGrid(ground, obstacles, empty, cellSize, viewPoint);
+		s->sensorData().clearRawData(false, false, false, true); // keep only the compressed copy
+	}
+	if((s == 0 || s->isSaved()) && _dbDriver)
+	{
+		_dbDriver->updateOccupancyGrid(id, ground, obstacles, empty, cellSize, viewPoint);
+	}
+}
+
+void Memory::applyMergedGrids(const std::map<int, Transform> & poses, std::set<int> * modifiedIds)
+{
+	if(_mergedGrids.empty())
+	{
+		return;
+	}
+	UTimer timer;
+	float radius = _reduceGraphGridRadius>0.0f?_reduceGraphGridRadius:_gridRangeMax>0.0f?2.0f*_gridRangeMax:10.0f;
+	int views = 0;
+	int cells = 0;
+	std::set<int> changedIds;
+	for(std::list<MergedGrid>::const_iterator iter=_mergedGrids.begin(); iter!=_mergedGrids.end(); ++iter)
+	{
+		std::map<int, Transform>::const_iterator target = poses.find(iter->targetId);
+		if(target == poses.end())
+		{
+			UWARN("Node %d is not in the optimized graph, the view merged into it is dropped.", iter->targetId);
+			continue;
+		}
+		++views;
+		cells += iter->ground.cols + iter->obstacles.cols + iter->empty.cols;
+		Transform newPose = target->second * iter->newInTarget;
+		std::set<CellKey> freeKeys;
+		std::set<CellKey> obstacleKeys;
+		insertKeys(iter->ground, newPose, iter->cellSize, freeKeys);
+		insertKeys(iter->empty, newPose, iter->cellSize, freeKeys);
+		insertKeys(iter->obstacles, newPose, iter->cellSize, obstacleKeys);
+		std::set<CellKey> keys = freeKeys;
+		keys.insert(obstacleKeys.begin(), obstacleKeys.end());
+
+		for(std::map<int, Transform>::const_iterator jter=poses.lower_bound(1); jter!=poses.end(); ++jter)
+		{
+			bool isTarget = jter->first == iter->targetId;
+			float dx = jter->second.x() - newPose.x();
+			float dy = jter->second.y() - newPose.y();
+			if(!isTarget && dx*dx+dy*dy > radius*radius)
+			{
+				continue;
+			}
+			SensorData data = this->getNodeData(jter->first, false, false, false, true);
+			if(data.gridCellSize() != iter->cellSize)
+			{
+				continue;
+			}
+			cv::Mat ground, obstacles, empty;
+			data.uncompressDataConst(0, 0, 0, 0, &ground, &obstacles, &empty);
+			bool changed = false;
+			if(isTarget)
+			{
+				// Its old cells there are replaced by the merged view (no duplicates).
+				ground = withoutCells(ground, jter->second, iter->cellSize, keys, changed);
+				obstacles = withoutCells(obstacles, jter->second, iter->cellSize, keys, changed);
+				empty = withoutCells(empty, jter->second, iter->cellSize, keys, changed);
+				ground = appendedCells(ground, iter->ground, iter->newInTarget);
+				obstacles = appendedCells(obstacles, iter->obstacles, iter->newInTarget);
+				empty = appendedCells(empty, iter->empty, iter->newInTarget);
+				changed = true;
+			}
+			else
+			{
+				// Only cells contradicting the merged view are removed. Cells agreeing with it
+				// are kept: every cell is seen by many nodes, and that redundancy is what keeps
+				// it filled when later optimizations shift poses by a few cm.
+				ground = withoutCells(ground, jter->second, iter->cellSize, obstacleKeys, changed);
+				empty = withoutCells(empty, jter->second, iter->cellSize, obstacleKeys, changed);
+				obstacles = withoutCells(obstacles, jter->second, iter->cellSize, freeKeys, changed);
+			}
+			if(changed)
+			{
+				setLocalGrid(jter->first, ground, obstacles, empty, iter->cellSize, data.gridViewPoint());
+				changedIds.insert(jter->first);
+			}
+		}
+	}
+	UINFO("Applied %d merged views (%d cells) to %d local grids (radius=%.1f m, %fs)",
+			views, cells, (int)changedIds.size(), radius, timer.ticks());
+	_mergedGrids.clear();
+	if(modifiedIds)
+	{
+		modifiedIds->insert(changedIds.begin(), changedIds.end());
+	}
 }
 
 int Memory::getNi(int signatureId) const

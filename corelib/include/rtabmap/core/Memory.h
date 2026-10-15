@@ -730,6 +730,20 @@ public:
 			int cropRadius = 1,
 			bool filterScans = false);
 
+	/**
+	 * @brief Applies the views of nodes merged by Mem/ReduceGraph since the last call
+	 *        (Mem/ReduceGraphGridOwnership).
+	 *
+	 * For each merged node, its confirmed cells are placed in the world with the optimized pose
+	 * of the node it was merged into, removed from the local grid of every node in @p poses
+	 * within Mem/ReduceGraphGridRadius, and added to the grid of the node it was merged into.
+	 * Grids are updated in memory and, for nodes already saved, in the database.
+	 *
+	 * @param poses Optimized poses of the current graph.
+	 * @param modifiedIds If not null, receives the ids of nodes whose local grid changed.
+	 */
+	void applyMergedGrids(const std::map<int, Transform> & poses, std::set<int> * modifiedIds = 0);
+
 	/** @return Visual word dictionary used for tf-idf likelihood and feature matching. */
 	const VWDictionary * getVWDictionary() const;
 
@@ -800,6 +814,21 @@ private:
 	bool rehearsalMerge(int oldId, int newId);
 	bool canBeReduced(const Link & link, float maxDistance, int direction);
 
+	// View of a node merged by Mem/ReduceGraph, waiting for the optimized poses
+	// (Mem/ReduceGraphGridOwnership).
+	struct MergedGrid
+	{
+		int targetId;          // node it was merged into
+		Transform newInTarget; // pose of the merged node in the target node frame
+		cv::Mat ground;        // confirmed cells, in the merged node frame
+		cv::Mat obstacles;
+		cv::Mat empty;
+		float cellSize;
+	};
+	bool confirmedGrid(const Signature * s, MergedGrid & merged);
+	void setLocalGrid(int id, const cv::Mat & ground, const cv::Mat & obstacles, const cv::Mat & empty,
+			float cellSize, const cv::Point3f & viewPoint);
+
 	const std::map<int, Signature*> & getSignatures() const {return _signatures;}
 
 	void copyData(const Signature * from, Signature * to);
@@ -835,6 +864,11 @@ private:
 	bool _localizationDataSaved;
 	bool _flannIndexSaved;
 	bool _reduceGraph;
+	bool _reduceGraphMergedKept;
+	bool _reduceGraphGridOwnership;
+	float _reduceGraphGridRadius;
+	float _gridRangeMax;
+	std::list<MergedGrid> _mergedGrids;
 	int _maxStMemSize;
 	float _recentWmRatio;
 	bool _transferSortingByWeightId;

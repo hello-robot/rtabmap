@@ -38,6 +38,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #endif
 #include <opencv2/imgproc/imgproc.hpp>
 #include <list>
+#include <set>
 #include <vector>
 #include <rtabmap/core/Signature.h>
 #include <rtabmap/core/Link.h>
@@ -541,6 +542,11 @@ public:
 	 * @param reducedIds Map of original IDs to reduced IDs
 	 */
 	void setReducedIds(const std::map<int, int> & reducedIds) {_reducedIds = reducedIds;}
+	/**
+	 * @brief Sets the nodes whose local grid was changed by Mem/ReduceGraphGridOwnership
+	 *        during this update. Map assemblers caching local grids must reload them.
+	 */
+	void setModifiedGridIds(const std::set<int> & modifiedGridIds) {_modifiedGridIds = modifiedGridIds;}
 	
 	/**
 	 * @brief Sets the working memory state
@@ -715,6 +721,8 @@ public:
 	 * @return Const reference to the map of original IDs to reduced IDs
 	 */
 	const std::map<int, int> & reducedIds() const {return _reducedIds;}
+	/** @return Nodes whose local grid changed during this update (see setModifiedGridIds()). */
+	const std::set<int> & modifiedGridIds() const {return _modifiedGridIds;}
 	
 	/**
 	 * @brief Returns the working memory state
@@ -777,6 +785,7 @@ private:
 	int _currentGoalId; ///< Current goal node ID (0 if no goal)
 
 	std::map<int, int> _reducedIds; ///< Mapping of original IDs to reduced/compressed IDs
+	std::set<int> _modifiedGridIds; ///< Nodes whose local grid changed during this update
 
 	std::vector<int> _wmState; ///< Working memory state (vector of node IDs in working memory)
 
